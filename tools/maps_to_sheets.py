@@ -18,12 +18,18 @@ import sys
 from urllib.parse import urljoin
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
+import psycopg2
+from psycopg2 import extras
 
 load_dotenv()
 
 # ============ CONTACT SCRAPING ============
 
 EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+
+# Phone number pattern (international format)
+PHONE_PATTERN = re.compile(r'[\+]?[0-9]{1,3}[-.\s]?[0-9]{2,4}[-.\s]?[0-9]{3,4}[-.\s]?[0-9]{3,4}')
+
 SOCIAL_PATTERNS = {
     'instagram': re.compile(r'(?:https?://)?(?:www\.)?instagram\.com/([a-zA-Z0-9_.]+)/?', re.IGNORECASE),
     'facebook': re.compile(r'(?:https?://)?(?:www\.)?facebook\.com/([a-zA-Z0-9.]+)/?', re.IGNORECASE),
@@ -34,8 +40,23 @@ SOCIAL_PATTERNS = {
     'line': re.compile(r'(?:https?://)?line\.me/(?:R/)?ti/p/([a-zA-Z0-9@~_-]+)/?', re.IGNORECASE),
 }
 
+# Additional patterns for chat widgets and embedded data
+WHATSAPP_WIDGET_PATTERNS = [
+    re.compile(r'wa\.me/(\d+)', re.IGNORECASE),
+    re.compile(r'whatsapp["\s:]+["\']?(\+?[\d\s-]{10,})', re.IGNORECASE),
+    re.compile(r'data-wa-number[="\s]+["\']?(\+?[\d\s-]{10,})', re.IGNORECASE),
+    re.compile(r'whatsappNumber["\s:]+["\']?(\+?[\d\s-]{10,})', re.IGNORECASE),
+]
+
+MESSENGER_WIDGET_PATTERNS = [
+    re.compile(r'm\.me/([a-zA-Z0-9.]+)', re.IGNORECASE),
+    re.compile(r'data-page-id[="\s]+["\']?(\d+)', re.IGNORECASE),  # Facebook page ID
+    re.compile(r'fb-messengermessageus[^>]*page_id[="\s]+["\']?(\d+)', re.IGNORECASE),
+    re.compile(r'messenger_app_id["\s:]+["\']?(\d+)', re.IGNORECASE),
+]
+
 def extract_contacts_from_html(html: str) -> dict:
-    """Extract contact information from HTML content."""
+    """Extract contact information from HTML content, including chat widgets."""
     contacts = {
         'emails': [],
         'instagram': None,
@@ -52,7 +73,7 @@ def extract_contacts_from_html(html: str) -> dict:
     filtered = [e for e in emails if not any(x in e.lower() for x in ['example.com', 'domain.com', 'wix', 'wordpress', 'sentry'])]
     contacts['emails'] = list(dict.fromkeys(filtered))[:3]
     
-    # Extract social links
+    # Extract social links from standard patterns
     for platform, pattern in SOCIAL_PATTERNS.items():
         matches = pattern.findall(html)
         if matches:
@@ -71,6 +92,32 @@ def extract_contacts_from_html(html: str) -> dict:
                 contacts[platform] = f"https://m.me/{handle}"
             elif platform == 'line':
                 contacts[platform] = f"https://line.me/ti/p/{handle}"
+    
+    # Enhanced WhatsApp detection (chat widgets, data attributes)
+    if not contacts['whatsapp']:
+        for pattern in WHATSAPP_WIDGET_PATTERNS:
+            matches = pattern.findall(html)
+            if matches:
+                # Clean up the phone number
+                phone = re.sub(r'[\s-]', '', matches[0])
+                if phone.startswith('+'):
+                    phone = phone[1:]
+                if len(phone) >= 9:  # Valid phone number length
+                    contacts['whatsapp'] = f"https://wa.me/{phone}"
+                    break
+    
+    # Enhanced Messenger detection (Facebook page ID, chat widgets)
+    if not contacts['messenger']:
+        for pattern in MESSENGER_WIDGET_PATTERNS:
+            matches = pattern.findall(html)
+            if matches:
+                page_id = matches[0]
+                # If it's a numeric page ID, use it directly
+                if page_id.isdigit():
+                    contacts['messenger'] = f"https://m.me/{page_id}"
+                else:
+                    contacts['messenger'] = f"https://m.me/{page_id}"
+                break
     
     return contacts
 
@@ -451,6 +498,116 @@ def update_sheets(data, sheet_id, creds_path, append_mode=False):
             ws.update(range_name="A1", values=[header] + data_rows, value_input_option="RAW")
             print(f"  📄 '{cat}': {len(export_df)} places")
 
+def update_postgres(data):
+    """Upload data to PostgreSQL database."""
+    db_host = os.getenv("DB_HOST")
+    db_name = os.getenv("DB_NAME")
+    db_user = os.getenv("DB_USER")
+    db_pass = os.getenv("DB_PASSWORD")
+    db_port = os.getenv("DB_PORT", "5432")
+
+    if not all([db_host, db_name, db_user, db_pass]):
+        print("⚠️ Skipping PostgreSQL: Missing configuration in .env")
+        return
+
+    try:
+        conn = psycopg2.connect(
+            host=db_host,
+            database=db_name,
+            user=db_user,
+            password=db_pass,
+            port=db_port
+        )
+        cur = conn.cursor()
+
+        # Create table if not exists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS places (
+                id SERIAL PRIMARY KEY,
+                location TEXT,
+                name TEXT,
+                rating FLOAT,
+                review_count INTEGER,
+                phone TEXT,
+                address TEXT,
+                website TEXT,
+                category TEXT,
+                has_website BOOLEAN,
+                sheet_category TEXT,
+                emails TEXT,
+                instagram TEXT,
+                facebook TEXT,
+                whatsapp TEXT,
+                telegram TEXT,
+                messenger TEXT,
+                line TEXT,
+                contact_status INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(name, address)
+            );
+        """)
+
+        # Add indexes as requested
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_places_location ON places (location);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_places_website ON places (website);")
+
+        # Upsert data
+        upsert_query = """
+            INSERT INTO places (
+                location, name, rating, review_count, phone, address, website, category,
+                has_website, sheet_category, emails, instagram, facebook, whatsapp, telegram, messenger, line
+            ) VALUES %s
+            ON CONFLICT (name, address) DO UPDATE SET
+                location = EXCLUDED.location,
+                rating = EXCLUDED.rating,
+                review_count = EXCLUDED.review_count,
+                phone = EXCLUDED.phone,
+                website = EXCLUDED.website,
+                category = EXCLUDED.category,
+                has_website = EXCLUDED.has_website,
+                sheet_category = EXCLUDED.sheet_category,
+                emails = EXCLUDED.emails,
+                instagram = EXCLUDED.instagram,
+                facebook = EXCLUDED.facebook,
+                whatsapp = EXCLUDED.whatsapp,
+                telegram = EXCLUDED.telegram,
+                messenger = EXCLUDED.messenger,
+                line = EXCLUDED.line,
+                updated_at = CURRENT_TIMESTAMP;
+        """
+
+        values = []
+        for p in data:
+            values.append((
+                p.get("Location", ""),
+                p.get("Name", ""),
+                p.get("Rating", 0),
+                p.get("Review Count", 0),
+                p.get("Phone", ""),
+                p.get("Address", ""),
+                p.get("Website", ""),
+                p.get("Category", ""),
+                p.get("_has_website", False),
+                p.get("_sheet_category", ""),
+                p.get("Emails", ""),
+                p.get("Instagram", ""),
+                p.get("Facebook", ""),
+                p.get("WhatsApp", ""),
+                p.get("Telegram", ""),
+                p.get("Messenger", ""),
+                p.get("LINE", "")
+            ))
+
+        if values:
+            extras.execute_values(cur, upsert_query, values)
+            conn.commit()
+            print(f"  🗄️ PostgreSQL: Updated {len(values)} records")
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ PostgreSQL Error: {e}")
+
 def main():
     args = parse_args()
     
@@ -524,6 +681,11 @@ def main():
     # Upload to Sheets
     print("\nUploading to Google Sheets...")
     update_sheets(results, sheet_id, creds_path, append_mode=args.append)
+
+    # Upload to PostgreSQL
+    print("\nSyncing with PostgreSQL...")
+    update_postgres(results)
+
     print("\n✅ Done!")
     print(f"API calls used: ~{len([q for q in ['restaurant', 'cafe', 'bar', 'hotel', 'spa', 'gym', 'shop', 'nightclub'] if not args.query]) or 1} Text Searches")
 

@@ -8,6 +8,7 @@ The framework is simple:
 - **Agent (`GEMINI.md`)**: The "Brain" instructions.
 - **Workflows (`workflows/`)**: Markdown SOPs describing *what* to do.
 - **Tools (`tools/`)**: Standalone Python scripts for *how* to do it.
+- **Walkthroughs (`walkthroughs/`)**: Historical reports and execution results.
 
 ### Roles
 1. **You (The User)**: Create tasks and approve critical actions.

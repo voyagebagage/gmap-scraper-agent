@@ -1,0 +1,35 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = 5
+}
+
+model Place {
+  id              Int      @id @default(autoincrement())
+  location        String?
+  name            String
+  rating          Float?
+  review_count    Int?
+  phone           String?
+  address         String
+  website         String?
+  category        String?
+  has_website     Boolean  @default(false)
+  sheet_category  String?
+  emails          String?
+  instagram       String?
+  facebook        String?
+  whatsapp        String?
+  telegram        String?
+  messenger       String?
+  line            String?
+  contact_status  Int?     @default(0)
+  updated_at      DateTime @default(now())
+
+  @@unique([name, address])
+  @@map("places")
+}
