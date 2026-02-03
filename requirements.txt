@@ -1,0 +1,8 @@
+pytz
+gspread
+pandas
+oauth2client
+python-dotenv
+google-genai
+python-telegram-bot
+prisma

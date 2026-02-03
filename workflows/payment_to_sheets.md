@@ -11,7 +11,7 @@ This workflow describes how to set up and use the Telegram bot to transcribe Tha
 1.  **Environment Variables**:
     - Open `.env` and add:
       ```env
-      PAYMENTPHOTOTOACCOUNTING_BOT_TOKEN=your_telegram_bot_token
+      SLIPSYNC_BOT_TOKEN=your_telegram_bot_token
       BOT_GSHEET_ID=your_google_sheet_id
       ```
 2.  **Dependencies**:

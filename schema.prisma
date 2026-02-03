@@ -33,3 +33,56 @@ model Place {
   @@unique([name, address])
   @@map("places")
 }
+
+model Subscription {
+  id               String   @id @default(uuid())
+  trial_expires_at DateTime
+  is_paid          Boolean  @default(false)
+  max_devices      Int      @default(3)
+  rate_limit_daily Int      @default(10)
+  gsheet_id        String?  // The user's Google Sheet ID
+  created_at       DateTime @default(now())
+  
+  users            AuthorizedUser[]
+  usage_logs       UsageLog[]
+  payments         Payment[]
+
+  @@map("subscriptions")
+}
+
+model AuthorizedUser {
+  id              String       @id @default(uuid())
+  platform_id     String       // Telegram ID or LINE ID
+  platform        String       // "telegram" or "line"
+  subscription_id String
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+
+  @@unique([platform_id, platform])
+  @@map("authorized_users")
+}
+
+model UsageLog {
+  id              Int          @id @default(autoincrement())
+  subscription_id String
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+  used_at         DateTime     @default(now())
+  platform        String       @default("telegram") // "telegram" or "line"
+
+  @@index([subscription_id, used_at])
+  @@map("usage_logs")
+}
+
+model Payment {
+  id              Int          @id @default(autoincrement())
+  subscription_id String
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+  amount          Float
+  currency        String       @default("THB")
+  sender_name     String?
+  reference_no    String?
+  platform        String       @default("telegram") // "telegram" or "line"
+  created_at      DateTime     @default(now())
+
+  @@index([subscription_id, created_at])
+  @@map("payments")
+}
