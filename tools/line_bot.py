@@ -10,6 +10,7 @@ import re
 from email.message import EmailMessage
 import pytz
 from typing import Optional
+from contextlib import asynccontextmanager
 
 import gspread
 import pandas as pd
@@ -19,20 +20,24 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from fastapi import FastAPI, Request, HTTPException
-from linebot.v3 import WebhookHandler
+from linebot.v3.webhook import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration,
-    ApiClient,
-    MessagingApi,
-    MessagingApiBlob,
+    AsyncApiClient,
+    AsyncMessagingApi,
+    AsyncMessagingApiBlob,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     ImageMessage,
     UserProfileResponse,
     QuickReply,
     QuickReplyItem,
-    PostbackAction
+    PostbackAction,
+    URIAction,
+    FlexMessage,
+    FlexContainer
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, PostbackEvent
 
@@ -54,6 +59,9 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GSHEET_ID = os.getenv("BOT_GSHEET_ID")
 GSHEET_CREDS_PATH = os.getenv("GSHEET_CREDS_PATH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Payment Constants
+PROMPTPAY_RECEIVER_NAME = os.getenv("PROMPTPAY_RECEIVER_NAME", "YOUR NAME HERE")
 
 # Email Configuration
 ACCOUNTING_EMAIL = os.getenv("ACCOUNTING_EMAIL")
@@ -78,10 +86,23 @@ if GSHEET_CREDS_PATH and os.path.exists(GSHEET_CREDS_PATH):
 
 # Initialize LINE API
 configuration = Configuration(access_token=LINE_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-app = FastAPI()
+parser = WebhookParser(LINE_SECRET)
 
-# Initialize Prisma & Gemini
+# Initialize Prisma
+db = Prisma()
+
+# FastAPI Lifespan for DB connection
+@asynccontextmanager
+async def lifespan(app):
+    await db.connect()
+    logger.info("Prisma connected.")
+    yield
+    await db.disconnect()
+    logger.info("Prisma disconnected.")
+
+app = FastAPI(lifespan=lifespan)
+
+# Initialize Gemini
 if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -89,8 +110,6 @@ if GEMINI_API_KEY:
         logger.error(f"Failed to initialize Gemini Client: {e}")
 else:
     logger.warning("GEMINI_API_KEY not found.")
-
-db = Prisma()
 
 # --- Translations ---
 MESSAGES = {
@@ -108,7 +127,9 @@ MESSAGES = {
         "trial_expired": "❌ Your trial has expired. Contact @autokoh to upgrade.",
         "undo_success": "✅ **Undo Successful!**\n\n- Removed from Google Sheet\n- Accounting notified\n- Daily Total updated",
         "undo_no_payment": "🧐 No recent payments found to undo.",
-        "undo_fail": "❌ Failed to undo the last action."
+        "undo_fail": "❌ Failed to undo the last action.",
+        "upgrade_info": "🚀 **Go Pro**\n\n1️⃣ Transfer to PromptPay:\n`081-XXX-XXXX` (Placeholder)\n\n2️⃣ Send the slip here.\n\n✨ Bot will upgrade you automatically!",
+        "pro_upgrade_success": "🎊 **PRO UPGRADE DETECTED!** 🎊\n\nThank you! Your account is now Pro. ✅",
     },
     "th": {
         "welcome": "ยินดีต้อนรับสู่ **SlipSync**! 🚀\n\n1️⃣ แชร์ Google Sheet ของคุณ (สิทธิ์ Editor) ให้ที่อีเมล:\n`slipsync@googlegroups.com` (แตะเพื่อคัดลอก)\n\n2️⃣ ส่ง URL ของ Sheet มาให้เราเพื่อเชื่อมต่อ\n\n3️⃣ ส่งรูปสลิปธนาคารเพื่อบันทึกข้อมูล! 📊",
@@ -119,7 +140,8 @@ MESSAGES = {
         "gsheet_fail": "❌ เชื่อมต่อ Google Sheet ไม่สำเร็จ",
         "link_instr": "กรุณาแชร์ชีตให้ `slipsync@googlegroups.com` และส่ง URL มาให้เราก่อนใช้งาน",
         "status": "📊 **สถานะ SlipSync**\nแพ็กเกจ: {plan}\nหมดอายุ: {expires}\nวันนี้: {count}/{limit}\nชีต: {sheet}",
-        "upgrade": "ติดต่อ @autokoh เพื่ออัปเกรดเป็น Pro!",
+        "upgrade": "🚀 อัปเกรดเป็น Pro!\n1️⃣ โอน PromptPay: `081-XXX-XXXX` \n2️⃣ ส่งสลิปมาที่นี่\n✨ ระบบจะอัปเกรดให้อัตโนมัติ",
+        "pro_upgrade_success": "🎊 **อัปเกรดเป็น PRO สำเร็จ!** 🎊\n\nขอบคุณสำหรับการสนับสนุน! บัญชีของคุณเป็น Pro แล้ว ✅",
         "daily_limit": "⚠️ ใช้งานครบจำนวนจำกัดต่อวันแล้ว ({limit} สลิป) กรุณาลองใหม่พรุ่งนี้",
         "trial_expired": "❌ ระยะเวลาทดลองใช้งานหมดแล้ว ติดต่อ @autokoh เพื่ออัปเกรด",
         "undo_success": "✅ **ยกเลิกสำเร็จ!**\n\n- ลบข้อมูลจาก Google Sheet แล้ว\n- แจ้งฝ่ายบัญชีแล้ว\n- อัปเดตยอดรวมวันนี้แล้ว",
@@ -141,18 +163,347 @@ MESSAGES = {
     }
 }
 
+def create_payment_flex_message(data: dict, daily_total: float, gsheet_id: str = None) -> dict:
+    """Create a beautiful Flex Message bubble for the payment summary."""
+    amount_str = f"{data.get('amount', 0):,.2f}"
+    currency = data.get('currency', 'THB')
+    
+    footer_contents = [
+        {
+            "type": "text",
+            "text": "Synced to Google Sheet ✅",
+            "size": "xs",
+            "color": "#aaaaaa",
+            "align": "center"
+        }
+    ]
+    
+    if gsheet_id:
+        footer_contents.insert(0, {
+            "type": "button",
+            "action": {
+                "type": "uri",
+                "label": "📊 Open Google Sheet",
+                "uri": f"https://docs.google.com/spreadsheets/d/{gsheet_id}"
+            },
+            "style": "primary",
+            "color": "#1DB446",
+            "margin": "md",
+            "height": "sm"
+        })
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "PAYMENT SUCCESS",
+                    "weight": "bold",
+                    "color": "#1DB446",
+                    "size": "sm"
+                }
+            ]
+        },
+        "hero": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"฿ {amount_str}",
+                    "size": "3xl",
+                    "weight": "bold",
+                    "color": "#111111",
+                    "align": "center",
+                    "margin": "md"
+                },
+                {
+                    "type": "text",
+                    "text": currency,
+                    "size": "sm",
+                    "color": "#aaaaaa",
+                    "align": "center"
+                }
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "separator",
+                    "margin": "md"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": "Sender", "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": str(data.get('sender_name', '-')), "size": "sm", "color": "#111111", "align": "end", "wrap": True}
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": "Receiver", "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": str(data.get('receiver_name', '-')), "size": "sm", "color": "#111111", "align": "end", "wrap": True}
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": "Date", "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": f"{data.get('date')} {data.get('time')}", "size": "sm", "color": "#111111", "align": "end"}
+                    ]
+                },
+                {
+                    "type": "separator",
+                    "margin": "xl"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": "Daily QR Total", "weight": "bold", "size": "md", "color": "#111111"},
+                        {"type": "text", "text": f"💰 ฿ {daily_total:,.2f}", "weight": "bold", "size": "md", "color": "#111111", "align": "end"}
+                    ]
+                }
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": footer_contents
+        },
+        "styles": {
+            "header": {"backgroundColor": "#f8f9fa"},
+            "footer": {"separator": True}
+        }
+    }
+
+def create_undo_flex_message(daily_total: float, lang: str, gsheet_id: str = None) -> dict:
+    """Create a Flex Message for Undo confirmation."""
+    labels = {
+        "en": "UNDO SUCCESSFUL",
+        "th": "ยกเลิกรายการสำเร็จ",
+        "my": "ပယ်ဖျက်ခြင်း အောင်မြင်သည်"
+    }
+    details = {
+        "en": "- Removed from Google Sheet\n- Accounting notified\n- Daily Total updated",
+        "th": "- ลบข้อมูลจาก Google Sheet แล้ว\n- แจ้งฝ่ายบัญชีแล้ว\n- อัปเดตยอดรวมรายวันแล้ว",
+        "my": "- Google Sheet မှ ဖျက်လိုက်ပါပြီ\n- စာရင်းကိုင်ကို အကြောင်းကြားပြီးပါပြီ\n- စုစုပေါင်းကို အပ်ဒိတ်လုပ်ပြီးပါပြီ"
+    }
+    
+    footer_contents = []
+    if gsheet_id:
+        footer_contents.append({
+            "type": "button",
+            "action": {
+                "type": "uri",
+                "label": "📊 Open Google Sheet",
+                "uri": f"https://docs.google.com/spreadsheets/d/{gsheet_id}"
+            },
+            "style": "secondary",
+            "height": "sm"
+        })
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": labels.get(lang, labels["en"]),
+                    "weight": "bold",
+                    "color": "#EB4E3D",
+                    "size": "sm"
+                }
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": details.get(lang, details["en"]),
+                    "size": "sm",
+                    "color": "#555555",
+                    "wrap": True
+                },
+                {
+                    "type": "separator",
+                    "margin": "lg"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": "Daily QR Total", "weight": "bold", "size": "md", "color": "#111111"},
+                        {"type": "text", "text": f"💰 ฿ {daily_total:,.2f}", "weight": "bold", "size": "md", "color": "#111111", "align": "end"}
+                    ]
+                }
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": footer_contents
+        } if footer_contents else None
+    }
+
+def create_error_flex_message(error_msg: str, lang: str) -> dict:
+    """Create a Flex Message for Error/Failure."""
+    title = "ERROR / FAILURE" if lang == "en" else "เกิดข้อผิดพลาด"
+    
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": title,
+                    "weight": "bold",
+                    "color": "#EB4E3D",
+                    "size": "sm"
+                }
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": error_msg,
+                    "size": "sm",
+                    "color": "#111111",
+                    "wrap": True
+                }
+            ]
+        }
+    }
+
+def create_welcome_flex_message(lang: str) -> dict:
+    """Create a Flex Message for onboarding with action buttons."""
+    titles = {
+        "en": "Welcome to SlipSync! 🚀",
+        "th": "ยินดีต้อนรับสู่ SlipSync! 🚀",
+        "my": "SlipSync မှ ကြိုဆိုပါ! 🚀"
+    }
+    step1 = {
+        "en": "1️⃣ Create or open your Google Sheet:",
+        "th": "1️⃣ สร้างหรือเปิด Google Sheet ของคุณ:",
+        "my": "1️⃣ Google Sheet ဖန်တီးပါ သို့မဟုတ် ဖွင့်ပါ:"
+    }
+    step2 = {
+        "en": "2️⃣ Share your Sheet (Editor access) with:",
+        "th": "2️⃣ แชร์ชีต (สิทธิ์ Editor) ให้กับ:",
+        "my": "2️⃣ Sheet ကို Editor access ဖြင့် share ပေးပါ:"
+    }
+    step3 = {
+        "en": "3️⃣ Send the Sheet URL here to link it.",
+        "th": "3️⃣ ส่ง URL ของ Sheet มาที่นี่เพื่อเชื่อมต่อ",
+        "my": "3️⃣ ချိတ်ဆက်ရန် Sheet URL ကို ဒီမှာ ပို့ပါ။"
+    }
+    step4 = {
+        "en": "4️⃣ Send a photo of a bank slip to sync! 📊",
+        "th": "4️⃣ ส่งรูปสลิปธนาคารเพื่อบันทึกข้อมูล! 📊",
+        "my": "4️⃣ ဘဏ်စလစ်ပုံပို့ပြီး sync လုပ်ပါ! 📊"
+    }
+    copy_label = {
+        "en": "📋 Tap to Copy Email",
+        "th": "📋 แตะเพื่อคัดลอกอีเมล",
+        "my": "📋 အီးမေးလ် ကူးယူရန် နှိပ်ပါ"
+    }
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#1DB446",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": titles.get(lang, titles["en"]),
+                    "weight": "bold",
+                    "color": "#ffffff",
+                    "size": "lg"
+                }
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": step1.get(lang, step1["en"]), "size": "sm", "color": "#111111", "wrap": True},
+                {
+                    "type": "button",
+                    "action": {
+                        "type": "uri",
+                        "label": "📊 Open Google Sheets",
+                        "uri": "https://sheets.new"
+                    },
+                    "style": "primary",
+                    "color": "#0F9D58",
+                    "height": "sm"
+                },
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": step2.get(lang, step2["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "lg"},
+                {
+                    "type": "text",
+                    "text": "slipsync@googlegroups.com",
+                    "size": "md",
+                    "weight": "bold",
+                    "color": "#1DB446",
+                    "align": "center",
+                    "margin": "md"
+                },
+                {
+                    "type": "button",
+                    "action": {
+                        "type": "clipboard",
+                        "label": copy_label.get(lang, copy_label["en"]),
+                        "clipboardText": "slipsync@googlegroups.com"
+                    },
+                    "style": "secondary",
+                    "height": "sm",
+                    "margin": "sm"
+                },
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": step3.get(lang, step3["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "lg"},
+                {"type": "text", "text": step4.get(lang, step4["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "md"}
+            ]
+        }
+    }
+
 async def get_user_language(user_id: str) -> str:
     """Detect user language from LINE profile."""
     try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            profile: UserProfileResponse = line_bot_api.get_profile(user_id)
-            lang = profile.language or "en"
-            if lang.startswith("th"): return "th"
-            if lang.startswith("my"): return "my"
-            return "en"
-    except Exception:
-        return "en"
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            profile: UserProfileResponse = await line_bot_api.get_profile(user_id)
+            if profile.language:
+                return profile.language
+    except Exception as e:
+        logger.error(f"Error fetching user profile for {user_id}: {e}")
+    return "en"
 
 def get_msg(key: str, lang: str, **kwargs) -> str:
     """Retrieve translated message."""
@@ -305,17 +656,23 @@ async def check_usage_and_rate_limit(subscription, lang: str):
 async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature")
     body = await request.body()
+    body_text = body.decode("utf-8")
+    
     try:
-        handler.handle(body.decode("utf-8"), signature)
+        events = parser.parse(body_text, signature)
     except InvalidSignatureError:
         raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    for event in events:
+        if isinstance(event, MessageEvent):
+            if isinstance(event.message, TextMessageContent):
+                await process_text(event.source.user_id, event.message.text, event.reply_token)
+            elif isinstance(event.message, ImageMessageContent):
+                await process_image(event.source.user_id, event.message.id, event.reply_token)
+        elif isinstance(event, PostbackEvent):
+            await process_postback(event.source.user_id, event.postback.data, event.reply_token)
+            
     return "OK"
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_text(event):
-    user_id = event.source.user_id
-    text = event.message.text
-    asyncio.run(process_text(user_id, text, event.reply_token))
 
 async def process_text(user_id, text, reply_token):
     lang = await get_user_language(user_id)
@@ -346,6 +703,9 @@ async def process_text(user_id, text, reply_token):
                         count=usage_count, 
                         limit=sub.rate_limit_daily, 
                         sheet="✅" if sub.gsheet_id else "❌")
+        
+        if not sub.is_paid:
+            reply += "\n\n" + get_msg("upgrade_info" if lang == "en" else "upgrade", lang)
     elif "undo" in text.lower():
         # Find last payment
         last_payment = await db.payment.find_first(
@@ -373,26 +733,40 @@ async def process_text(user_id, text, reply_token):
             await db.payment.delete(where={'id': last_payment.id})
             reply = get_msg("undo_success", lang)
     else:
-        reply = get_msg("welcome", lang, email=SERVICE_ACCOUNT_EMAIL)
+        # New user or unknown command -> send welcome Flex card
+        flex_content = create_welcome_flex_message(lang)
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[FlexMessage(alt_text="Welcome to SlipSync!", contents=FlexContainer.from_dict(flex_content))]
+            ))
+        return
 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(ReplyMessageRequest(
+    async with AsyncApiClient(configuration) as api_client:
+        line_bot_api = AsyncMessagingApi(api_client)
+        await line_bot_api.reply_message(ReplyMessageRequest(
             reply_token=reply_token,
             messages=[TextMessage(text=reply)]
         ))
 
-@handler.add(PostbackEvent)
-def handle_postback(event):
-    user_id = event.source.user_id
-    data = event.postback.data
-    reply_token = event.reply_token
-    asyncio.run(process_postback(user_id, data, reply_token))
+# Postback handling is now done in process_postback called from callback
 
 async def process_postback(user_id, data, reply_token):
     if data == 'undo_last':
         lang = await get_user_language(user_id)
         sub = await get_or_create_sub(user_id)
+        
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            # Show loading animation
+            try:
+                await line_bot_api.show_loading_animation(user_id, 20)
+            except Exception: pass
+            
+            # Send processing text
+            processing_text = "กำลังประมวลผลการยกเลิก... ⏳" if lang == "th" else "Processing undo... ⏳"
+            await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=processing_text)]))
         
         last_payment = await db.payment.find_first(
             where={'subscription_id': sub.id},
@@ -400,7 +774,8 @@ async def process_postback(user_id, data, reply_token):
         )
         
         if not last_payment:
-            reply = get_msg("undo_no_payment", lang)
+            flex_content = create_error_flex_message(get_msg("undo_no_payment", lang), lang)
+            messages = [FlexMessage(alt_text="Undo Failed", contents=FlexContainer.from_dict(flex_content))]
         else:
             # Execute Undo
             gs_success = delete_row_from_gsheet(last_payment.reference_no, sub.gsheet_id)
@@ -424,50 +799,58 @@ async def process_postback(user_id, data, reply_token):
             )
             new_total = sum(p.amount for p in payments)
             
-            reply = get_msg("undo_success", lang) + f"\n\n💰 Daily Total: {new_total:,.2f} THB"
+            flex_content = create_undo_flex_message(new_total, lang, sub.gsheet_id)
+            messages = [FlexMessage(alt_text="Undo Success", contents=FlexContainer.from_dict(flex_content))]
 
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(ReplyMessageRequest(
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=reply)]
+                messages=messages
             ))
-
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image(event):
-    user_id = event.source.user_id
-    msg_id = event.message.id
-    reply_token = event.reply_token
-    asyncio.run(process_image(user_id, msg_id, reply_token))
 
 async def process_image(user_id, msg_id, reply_token):
     lang = await get_user_language(user_id)
     sub = await get_or_create_sub(user_id)
     
     # Check limit
-    is_allowed, reason = await check_usage_and_rate_limit(sub, lang)
-    if not is_allowed:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(ReplyMessageRequest(
+    async with AsyncApiClient(configuration) as api_client:
+        line_bot_api = AsyncMessagingApi(api_client)
+        allowed, reason = await check_usage_and_rate_limit(sub, lang)
+        if not allowed:
+            await line_bot_api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
                 messages=[TextMessage(text=reason)]
             ))
-        return
+            return
 
     # Show loading animation
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
+    async with AsyncApiClient(configuration) as api_client:
+        line_bot_api = AsyncMessagingApi(api_client)
         try:
-            line_bot_api.show_loading_animation(user_id, 30) # 30 seconds max
+            await line_bot_api.show_loading_animation(user_id, 30) # 30 seconds max
         except Exception as e:
             logger.warning(f"Failed to show loading animation: {e}")
+        
+        # Send processing text in Thai/English
+        proc_text = "กำลังประมวลผลสลิปของคุณ... ⏳" if lang == "th" else "Processing your slip... ⏳"
+        await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=proc_text)]))
 
     # Image download & save
-    with ApiClient(configuration) as api_client:
-        api_blob = MessagingApiBlob(api_client)
-        content = api_blob.get_message_content(msg_id)
-        image_bytes = bytes(content)
+    async with AsyncApiClient(configuration) as api_client:
+        api_blob = AsyncMessagingApiBlob(api_client)
+        try:
+            content = await api_blob.get_message_content(msg_id)
+            image_bytes = content
+        except Exception as e:
+            logger.error(f"Failed to download image from LINE: {e}")
+            line_bot_api = AsyncMessagingApi(api_client)
+            error_card = create_error_flex_message("Failed to download image. Please try again later.", lang)
+            await line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[FlexMessage(alt_text="Error", contents=FlexContainer.from_dict(error_card))]
+            ))
+            return
 
     filename = f"line_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{user_id}.jpg"
     image_path = os.path.join(IMAGE_DIR, filename)
@@ -477,13 +860,28 @@ async def process_image(user_id, msg_id, reply_token):
     # OCR & GSheet
     data = await extract_data_from_image(image_bytes)
     if not data:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(ReplyMessageRequest(
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            error_card = create_error_flex_message(get_msg("ocr_failed", lang), lang)
+            await line_bot_api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=get_msg("ocr_failed", lang))]
+                messages=[FlexMessage(alt_text="OCR Failed", contents=FlexContainer.from_dict(error_card))]
             ))
         return
+
+    # Check for Auto-Upgrade (PromptPay OCR)
+    if not sub.is_paid and PROMPTPAY_RECEIVER_NAME != "YOUR NAME HERE":
+        extracted_receiver = str(data.get('receiver_name', '')).upper()
+        if PROMPTPAY_RECEIVER_NAME.upper() in extracted_receiver:
+            await db.subscription.update(
+                where={'id': sub.id},
+                data={'is_paid': True, 'rate_limit_daily': 1000}
+            )
+            sub.is_paid = True
+            async with AsyncApiClient(configuration) as api_client:
+                line_bot_api = AsyncMessagingApi(api_client)
+                await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=get_msg("pro_upgrade_success", lang))]))
+            logger.info(f"Auto-upgraded LINE subscription {sub.id} via OCR.")
 
     # Log usage
     await db.usagelog.create(data={'subscription_id': sub.id, 'platform': 'line'})
@@ -508,46 +906,46 @@ async def process_image(user_id, msg_id, reply_token):
     except Exception as e:
         logger.error(f"Failed to save payment record (LINE): {e}")
 
-    # Push summary (using reply token for the first message)
-    summary = f"💰 {data.get('amount')} {data.get('currency')}\n👤 {data.get('sender_name')}\n📅 {data.get('date')} {data.get('time')}"
+    # Calculate Daily sum
+    th_tz = pytz.timezone('Asia/Bangkok')
+    now_th = datetime.datetime.now(th_tz)
+    start_of_day_th = now_th.replace(hour=0, minute=0, second=0, microsecond=0)
     
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        # We reply with the summary
-        line_bot_api.reply_message(ReplyMessageRequest(
+    payments = await db.payment.find_many(
+        where={
+            'subscription_id': sub.id,
+            'created_at': {'gte': start_of_day_th}
+        }
+    )
+    daily_sum = sum(p.amount for p in payments)
+
+    # Prepare Flex Message
+    flex_content = create_payment_flex_message(data, daily_sum, sub.gsheet_id)
+    quick_reply = QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(label="Undo ↩️", data="undo_last", display_text="Undo Last Action"))
+    ])
+    
+    flex_message = FlexMessage(
+        alt_text=f"Payment Summary: {data.get('amount')} {data.get('currency')}",
+        contents=FlexContainer.from_dict(flex_content),
+        quick_reply=quick_reply
+    )
+
+    async with AsyncApiClient(configuration) as api_client:
+        line_bot_api = AsyncMessagingApi(api_client)
+        
+        # Reply with Flex Message
+        await line_bot_api.reply_message(ReplyMessageRequest(
             reply_token=reply_token,
-            messages=[TextMessage(text=summary)]
+            messages=[flex_message]
         ))
         
-        # Then we push updates (since we can only reply once)
-        # Update GSheet
+        # Then we push GSheet update notification if successful
         success = update_gsheet(data, image_path, sub.gsheet_id)
-        if success:
-            # Calculate Daily sum
-            th_tz = pytz.timezone('Asia/Bangkok')
-            now_th = datetime.datetime.now(th_tz)
-            start_of_day_th = now_th.replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            payments = await db.payment.find_many(
-                where={
-                    'subscription_id': sub.id,
-                    'created_at': {'gte': start_of_day_th}
-                }
-            )
-            daily_sum = sum(p.amount for p in payments)
-            
-            # Send Success Message with Quick Reply Undo
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label="Undo ↩️", data="undo_last", display_text="Undo Last Action"))
-            ])
-            
-            msg_text = get_msg("success", lang, daily_total=daily_sum)
-            line_bot_api.push_message(user_id, TextMessage(text=msg_text, quick_reply=quick_reply))
-        else:
-            line_bot_api.push_message(user_id, TextMessage(text=get_msg("link_instr", lang)))
+        if not success:
+            error_card = create_error_flex_message(get_msg("link_instr", lang), lang)
+            await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[FlexMessage(alt_text="GSheet Error", contents=FlexContainer.from_dict(error_card))]))
 
 if __name__ == "__main__":
     import uvicorn
-    # Make sure to connect DB
-    asyncio.run(db.connect())
     uvicorn.run(app, host="0.0.0.0", port=8000)

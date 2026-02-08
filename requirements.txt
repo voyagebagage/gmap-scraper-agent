@@ -6,3 +6,6 @@ python-dotenv
 google-genai
 python-telegram-bot
 prisma
+line-bot-sdk
+fastapi
+uvicorn

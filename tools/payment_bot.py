@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from telegram import Update, File, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler, PreCheckoutQueryHandler
 
 from prisma import Prisma
 
@@ -59,6 +59,10 @@ if GSHEET_CREDS_PATH and os.path.exists(GSHEET_CREDS_PATH):
             SERVICE_ACCOUNT_EMAIL = creds_data.get('client_email')
     except Exception as e:
         logger.warning(f"Could not load service account email: {e}")
+
+# Payment Constants
+PROMPTPAY_RECEIVER_NAME = os.getenv("PROMPTPAY_RECEIVER_NAME", "YOUR NAME HERE")
+STARS_PRICE = int(os.getenv("STARS_PRICE", 500)) # Default 500 Stars for Pro
 
 # Configure Gemini Client
 if GEMINI_API_KEY:
@@ -362,6 +366,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to parse the bank slip. Please make sure the image is clear.")
             return
 
+        # Check for Auto-Upgrade (PromptPay OCR)
+        if not sub.is_paid and PROMPTPAY_RECEIVER_NAME != "YOUR NAME HERE":
+            extracted_receiver = str(data.get('receiver_name', '')).upper()
+            if PROMPTPAY_RECEIVER_NAME.upper() in extracted_receiver:
+                await db.subscription.update(
+                    where={'id': sub.id},
+                    data={'is_paid': True, 'rate_limit_daily': 1000} # Upgrade to Pro
+                )
+                sub.is_paid = True
+                await update.message.reply_text("🎊 **PRO UPGRADE DETECTED!** 🎊\n\nThank you for your payment! Your account has been upgraded to SlipSync Pro automatically. ✅")
+                logger.info(f"Auto-upgraded subscription {sub.id} via OCR match.")
+
         # Log usage
         await db.usagelog.create(data={'subscription_id': sub.id, 'platform': 'telegram'})
         
@@ -488,9 +504,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ **Send a photo** of a Thai bank slip.\n\n"
         "I will extract the details and sync them to your sheet instantly! 📊\n\n"
         "🎁 **Free Trial**: 1 week free (max 10 slips/day).\n"
+        "🚀 **Go Pro**: Use /upgrade to unlock Email and unlimited slips!\n"
         "Use /status to check your plan."
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Upgrade command handler."""
+    msg = (
+        "🚀 **Upgrade to SlipSync Pro**\n\n"
+        "Unlock premium features:\n"
+        "✅ **Auto-Email** to Accounting\n"
+        "✅ **Unlimited** Slips (No daily limit)\n"
+        "✅ **Custom** Integrations\n\n"
+        "Choose your payment method:"
+    )
+    keyboard = [
+        [InlineKeyboardButton(f"Pay with Telegram Stars (⭐️ {STARS_PRICE})", callback_data='pay_stars')],
+        [InlineKeyboardButton("Pay with PromptPay (QR Code)", callback_data='pay_promptpay')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pre-checkout query."""
+    query = update.pre_checkout_query
+    # Check if invoice payload is correct
+    if query.invoice_payload != 'pro_upgrade_stars':
+        await query.answer(ok=False, error_message="Something went wrong...")
+    else:
+        await query.answer(ok=True)
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle successful payment."""
+    telegram_id = update.message.from_user.id
+    try:
+        if not db.is_connected():
+            await db.connect()
+        sub = await get_or_create_subscription(telegram_id)
+        await db.subscription.update(
+            where={'id': sub.id},
+            data={'is_paid': True, 'rate_limit_daily': 1000}
+        )
+        await update.message.reply_text(
+            "🎊 **Payment Successful!** 🎊\n\nWelcome to **SlipSync Pro**. Your account has been upgraded! 🚀",
+            parse_mode='Markdown'
+        )
+        logger.info(f"Upgraded subscription {sub.id} via Telegram Stars.")
+    except Exception as e:
+        logger.error(f"Error in successful selection: {e}")
+        await update.message.reply_text("❌ Upgrade successful but database update failed. Please contact @autokoh.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Status command handler."""
@@ -675,6 +738,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error in callback undo: {e}")
             await query.answer(text="❌ Failed to undo.")
 
+    elif query.data == 'pay_stars':
+        # Send Invoice for Stars
+        title = "SlipSync Pro Upgrade"
+        description = "One-time upgrade to unlock all premium features."
+        payload = "pro_upgrade_stars"
+        currency = "XTR"
+        price = STARS_PRICE
+        prices = [types.LabeledPrice("Pro Upgrade", price)]
+
+        await context.bot.send_invoice(
+            chat_id=query.message.chat_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="", # Empty for Telegram Stars
+            currency=currency,
+            prices=prices
+        )
+        await query.answer()
+
+    elif query.data == 'pay_promptpay':
+        msg = (
+            "💰 **PromptPay Payment**\n\n"
+            "1️⃣ Transfer to this PromptPay account (Owner):\n"
+            "`081-XXX-XXXX` (Placeholder)\n\n"
+            "2️⃣ **Send the payment slip (photo)** directly to this bot.\n\n"
+            "✨ The bot will use OCR to verify your payment and **upgrade you instantly!**"
+        )
+        await query.edit_message_text(msg, parse_mode='Markdown')
+        await query.answer()
+
     elif query.data == 'check_total':
         telegram_id = query.from_user.id
         try:
@@ -714,10 +808,13 @@ if __name__ == '__main__':
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('status', status))
+    application.add_handler(CommandHandler('upgrade', upgrade))
     application.add_handler(CommandHandler('link', link_device))
     application.add_handler(CommandHandler('undo', undo))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     
     print("SlipSync Bot is starting...")
