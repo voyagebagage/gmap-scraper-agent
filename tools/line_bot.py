@@ -59,6 +59,7 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GSHEET_ID = os.getenv("BOT_GSHEET_ID")
 GSHEET_CREDS_PATH = os.getenv("GSHEET_CREDS_PATH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SERVER_BASE_URL = os.getenv("SERVER_BASE_URL", "http://localhost:8000")  # ngrok URL or server URL
 
 # Payment Constants
 PROMPTPAY_RECEIVER_NAME = os.getenv("PROMPTPAY_RECEIVER_NAME", "YOUR NAME HERE")
@@ -91,6 +92,15 @@ parser = WebhookParser(LINE_SECRET)
 # Initialize Prisma
 db = Prisma()
 
+def generate_invite_code(length=6):
+    """Generate a short, readable invite code."""
+    import random
+    import string
+    chars = string.ascii_uppercase + string.digits
+    # Remove confusing characters (O, 0, I, 1, L)
+    chars = chars.replace('O', '').replace('0', '').replace('I', '').replace('1', '').replace('L', '')
+    return ''.join(random.choice(chars) for _ in range(length))
+
 # FastAPI Lifespan for DB connection
 @asynccontextmanager
 async def lifespan(app):
@@ -101,6 +111,10 @@ async def lifespan(app):
     logger.info("Prisma disconnected.")
 
 app = FastAPI(lifespan=lifespan)
+
+# Mount static files for serving slip images
+from starlette.staticfiles import StaticFiles
+app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
 # Initialize Gemini
 if GEMINI_API_KEY:
@@ -163,7 +177,7 @@ MESSAGES = {
     }
 }
 
-def create_payment_flex_message(data: dict, daily_total: float, gsheet_id: str = None) -> dict:
+def create_payment_flex_message(data: dict, daily_total: float, slips_count: int = 0, gsheet_id: str = None) -> dict:
     """Create a beautiful Flex Message bubble for the payment summary."""
     amount_str = f"{data.get('amount', 0):,.2f}"
     currency = data.get('currency', 'THB')
@@ -275,6 +289,15 @@ def create_payment_flex_message(data: dict, daily_total: float, gsheet_id: str =
                     "contents": [
                         {"type": "text", "text": "Daily QR Total", "weight": "bold", "size": "md", "color": "#111111"},
                         {"type": "text", "text": f"💰 ฿ {daily_total:,.2f}", "weight": "bold", "size": "md", "color": "#111111", "align": "end"}
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "sm",
+                    "contents": [
+                        {"type": "text", "text": "Today's Slips", "size": "sm", "color": "#555555"},
+                        {"type": "text", "text": f"📋 {slips_count} processed", "size": "sm", "color": "#1DB446", "align": "end"}
                     ]
                 }
             ]
@@ -398,17 +421,185 @@ def create_error_flex_message(error_msg: str, lang: str) -> dict:
         }
     }
 
+def create_status_flex_message(sub, usage_count: int, lang: str) -> dict:
+    """Create a Status Flex Message for /status command."""
+    titles = {
+        "en": "SlipSync Status 📊",
+        "th": "สถานะ SlipSync 📊",
+        "my": "SlipSync အခြေအနေ 📊"
+    }
+    plan_labels = {"en": "Plan", "th": "แพ็กเกจ", "my": "အမျိုးအစား"}
+    expires_labels = {"en": "Expires", "th": "หมดอายุ", "my": "သက်တမ်းကုန်"}
+    usage_labels = {"en": "Today's Usage", "th": "ใช้งานวันนี้", "my": "ယနေ့အသုံးပြု"}
+    sheet_labels = {"en": "Google Sheet", "th": "Google Sheet", "my": "Google Sheet"}
+    
+    plan_str = "Pro ✅" if sub.is_paid else "Free Trial 🎁"
+    expires_str = sub.trial_expires_at.strftime("%Y-%m-%d") if sub.trial_expires_at else "-"
+    usage_str = f"{usage_count} / {sub.rate_limit_daily}"
+    sheet_str = "Linked ✅" if sub.gsheet_id else "Not Linked ❌"
+    
+    footer_contents = []
+    if sub.gsheet_id:
+        footer_contents.append({
+            "type": "button",
+            "action": {
+                "type": "uri",
+                "label": "📊 Open Google Sheet",
+                "uri": f"https://docs.google.com/spreadsheets/d/{sub.gsheet_id}"
+            },
+            "style": "primary",
+            "color": "#1DB446",
+            "height": "sm"
+        })
+    
+    if not sub.is_paid:
+        footer_contents.append({
+            "type": "button",
+            "action": {
+                "type": "message",
+                "label": "🚀 Upgrade to Pro",
+                "text": "upgrade"
+            },
+            "style": "secondary",
+            "height": "sm",
+            "margin": "md"
+        })
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#1DB446",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": titles.get(lang, titles["en"]),
+                    "weight": "bold",
+                    "color": "#ffffff",
+                    "size": "lg"
+                }
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": plan_labels.get(lang, plan_labels["en"]), "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": plan_str, "size": "sm", "color": "#111111", "align": "end", "weight": "bold"}
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": expires_labels.get(lang, expires_labels["en"]), "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": expires_str, "size": "sm", "color": "#111111", "align": "end"}
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": usage_labels.get(lang, usage_labels["en"]), "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": usage_str, "size": "sm", "color": "#111111", "align": "end"}
+                    ]
+                },
+                {"type": "separator", "margin": "lg"},
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "md",
+                    "contents": [
+                        {"type": "text", "text": sheet_labels.get(lang, sheet_labels["en"]), "size": "sm", "color": "#555555", "flex": 0},
+                        {"type": "text", "text": sheet_str, "size": "sm", "color": "#111111", "align": "end", "weight": "bold"}
+                    ]
+                }
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": footer_contents
+        } if footer_contents else None
+    }
+
 def create_welcome_flex_message(lang: str) -> dict:
-    """Create a Flex Message for onboarding with action buttons."""
+    """Create a Flex Message for onboarding with GSheet linking options."""
     titles = {
         "en": "Welcome to SlipSync! 🚀",
         "th": "ยินดีต้อนรับสู่ SlipSync! 🚀",
         "my": "SlipSync မှ ကြိုဆိုပါ! 🚀"
     }
+    subtitle = {
+        "en": "Sync bank slips to Google Sheets instantly!",
+        "th": "ซิงค์สลิปธนาคารลง Google Sheet ทันที!",
+        "my": "ဘဏ်စလစ်များကို Google Sheets သို့ ချက်ချင်း sync လုပ်ပါ!"
+    }
+    choose = {
+        "en": "Choose how to connect:",
+        "th": "เลือกวิธีเชื่อมต่อ:",
+        "my": "ချိတ်ဆက်မည့်နည်းကို ရွေးပါ:"
+    }
+    option_a = {
+        "en": "🔗 I Have a Sheet",
+        "th": "🔗 มี Sheet อยู่แล้ว",
+        "my": "🔗 Sheet ရှိပြီးသား"
+    }
+    option_b = {
+        "en": "✨ Create New (Coming Soon)",
+        "th": "✨ สร้างใหม่อัตโนมัติ (เร็วๆ นี้)",
+        "my": "✨ အသစ် ဖန်တီးပါ (မကြာမီ)"
+    }
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#1DB446",
+            "paddingAll": "lg",
+            "contents": [
+                {"type": "text", "text": titles.get(lang, titles["en"]), "weight": "bold", "color": "#ffffff", "size": "xl"},
+                {"type": "text", "text": subtitle.get(lang, subtitle["en"]), "color": "#ffffffcc", "size": "sm", "margin": "sm"}
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "lg",
+            "contents": [
+                {"type": "text", "text": choose.get(lang, choose["en"]), "size": "md", "color": "#111111", "weight": "bold"},
+                {
+                    "type": "button",
+                    "action": {"type": "postback", "label": option_a.get(lang, option_a["en"]), "data": "onboard_manual", "displayText": "I have an existing Sheet"},
+                    "style": "primary",
+                    "color": "#0F9D58",
+                    "height": "sm"
+                },
+                {"type": "text", "text": "— or —", "size": "xs", "color": "#aaaaaa", "align": "center"},
+                {
+                    "type": "button",
+                    "action": {"type": "postback", "label": option_b.get(lang, option_b["en"]), "data": "onboard_auto", "displayText": "Create new sheet automatically"},
+                    "style": "secondary",
+                    "height": "sm"
+                }
+            ]
+        }
+    }
+
+def create_manual_onboard_flex_message(lang: str) -> dict:
+    """Create step-by-step Flex Message for manual GSheet linking."""
     step1 = {
-        "en": "1️⃣ Create or open your Google Sheet:",
-        "th": "1️⃣ สร้างหรือเปิด Google Sheet ของคุณ:",
-        "my": "1️⃣ Google Sheet ဖန်တီးပါ သို့မဟုတ် ဖွင့်ပါ:"
+        "en": "1️⃣ Open or create your Google Sheet:",
+        "th": "1️⃣ เปิดหรือสร้าง Google Sheet:",
+        "my": "1️⃣ Google Sheet ဖွင့်ပါ သို့မဟုတ် ဖန်တီးပါ:"
     }
     step2 = {
         "en": "2️⃣ Share your Sheet (Editor access) with:",
@@ -436,15 +627,9 @@ def create_welcome_flex_message(lang: str) -> dict:
         "header": {
             "type": "box",
             "layout": "vertical",
-            "backgroundColor": "#1DB446",
+            "backgroundColor": "#0F9D58",
             "contents": [
-                {
-                    "type": "text",
-                    "text": titles.get(lang, titles["en"]),
-                    "weight": "bold",
-                    "color": "#ffffff",
-                    "size": "lg"
-                }
+                {"type": "text", "text": "Manual Setup 🔗", "weight": "bold", "color": "#ffffff", "size": "md"}
             ]
         },
         "body": {
@@ -455,17 +640,13 @@ def create_welcome_flex_message(lang: str) -> dict:
                 {"type": "text", "text": step1.get(lang, step1["en"]), "size": "sm", "color": "#111111", "wrap": True},
                 {
                     "type": "button",
-                    "action": {
-                        "type": "uri",
-                        "label": "📊 Open Google Sheets",
-                        "uri": "https://sheets.new"
-                    },
+                    "action": {"type": "uri", "label": "📊 Open Google Sheets", "uri": "https://sheets.new"},
                     "style": "primary",
                     "color": "#0F9D58",
                     "height": "sm"
                 },
                 {"type": "separator", "margin": "lg"},
-                {"type": "text", "text": step2.get(lang, step2["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "lg"},
+                {"type": "text", "text": step2.get(lang, step2["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "md"},
                 {
                     "type": "text",
                     "text": "slipsync@googlegroups.com",
@@ -477,18 +658,14 @@ def create_welcome_flex_message(lang: str) -> dict:
                 },
                 {
                     "type": "button",
-                    "action": {
-                        "type": "clipboard",
-                        "label": copy_label.get(lang, copy_label["en"]),
-                        "clipboardText": "slipsync@googlegroups.com"
-                    },
+                    "action": {"type": "clipboard", "label": copy_label.get(lang, copy_label["en"]), "clipboardText": "slipsync@googlegroups.com"},
                     "style": "secondary",
                     "height": "sm",
                     "margin": "sm"
                 },
                 {"type": "separator", "margin": "lg"},
-                {"type": "text", "text": step3.get(lang, step3["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "lg"},
-                {"type": "text", "text": step4.get(lang, step4["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "md"}
+                {"type": "text", "text": step3.get(lang, step3["en"]), "size": "sm", "color": "#111111", "wrap": True, "margin": "md"},
+                {"type": "text", "text": step4.get(lang, step4["en"]), "size": "sm", "color": "#555555", "wrap": True, "margin": "md", "size": "xs"}
             ]
         }
     }
@@ -681,15 +858,41 @@ async def process_text(user_id, text, reply_token):
     match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', text)
     if match:
         gsheet_id = match.group(1)
-        await db.subscription.update(
-            where={'id': sub.id},
-            data={'gsheet_id': gsheet_id}
-        )
-        reply = get_msg("gsheet_linked", lang, id=gsheet_id, email=SERVICE_ACCOUNT_EMAIL)
-    elif "status" in text.lower():
-        status_str = "Pro ✅" if sub.is_paid else "Free Trial 🎁"
-        expires = sub.trial_expires_at.strftime("%Y-%m-%d")
         
+        # Check if this sheet already exists
+        existing_sheet = await db.sheet.find_first(where={'gsheet_id': gsheet_id})
+        if existing_sheet:
+            # User is re-linking an existing sheet, just set as active
+            await db.subscription.update(where={'id': sub.id}, data={'active_sheet_id': existing_sheet.id})
+            reply = f"✅ Sheet already linked! Set as active.\n\nType /invite to share with staff."
+        else:
+            # Create new Sheet with unique invite code
+            invite_code = generate_invite_code()
+            # Ensure code is unique
+            while await db.sheet.find_unique(where={'invite_code': invite_code}):
+                invite_code = generate_invite_code()
+            
+            new_sheet = await db.sheet.create(
+                data={
+                    'gsheet_id': gsheet_id,
+                    'invite_code': invite_code
+                }
+            )
+            
+            # Create membership as manager
+            await db.sheetmembership.create(
+                data={
+                    'subscription_id': sub.id,
+                    'sheet_id': new_sheet.id,
+                    'role': 'manager'
+                }
+            )
+            
+            # Set as active sheet
+            await db.subscription.update(where={'id': sub.id}, data={'active_sheet_id': new_sheet.id})
+            
+            reply = f"✅ **Sheet Linked!**\n\nInvite Code: `{invite_code}`\n\nShare with staff: Type /invite\n\nDon't forget to share Editor access with:\n`{SERVICE_ACCOUNT_EMAIL}`"
+    elif "status" in text.lower():
         # Count usage today
         now = datetime.datetime.now()
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -697,15 +900,15 @@ async def process_text(user_id, text, reply_token):
             where={'subscription_id': sub.id, 'used_at': {'gte': start_of_day}}
         )
         
-        reply = get_msg("status", lang, 
-                        plan=status_str, 
-                        expires=expires, 
-                        count=usage_count, 
-                        limit=sub.rate_limit_daily, 
-                        sheet="✅" if sub.gsheet_id else "❌")
-        
-        if not sub.is_paid:
-            reply += "\n\n" + get_msg("upgrade_info" if lang == "en" else "upgrade", lang)
+        # Send Status Flex card
+        flex_content = create_status_flex_message(sub, usage_count, lang)
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[FlexMessage(alt_text="SlipSync Status", contents=FlexContainer.from_dict(flex_content))]
+            ))
+        return
     elif "undo" in text.lower():
         # Find last payment
         last_payment = await db.payment.find_first(
@@ -732,6 +935,89 @@ async def process_text(user_id, text, reply_token):
             # Delete from DB
             await db.payment.delete(where={'id': last_payment.id})
             reply = get_msg("undo_success", lang)
+    elif text.lower().startswith("/invite"):
+        # Manager sharing their sheet invite code
+        # Get user's active sheet where they are manager
+        membership = await db.sheetmembership.find_first(
+            where={'subscription_id': sub.id, 'role': 'manager'},
+            include={'sheet': True}
+        )
+        if membership and membership.sheet:
+            invite_code = membership.sheet.invite_code
+            sheet_name = membership.sheet.name or "Your Sheet"
+            invite_flex = {
+                "type": "bubble",
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#1DB446",
+                    "paddingAll": "lg",
+                    "contents": [
+                        {"type": "text", "text": "📤 Invite Staff", "weight": "bold", "color": "#ffffff", "size": "lg"}
+                    ]
+                },
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "lg",
+                    "contents": [
+                        {"type": "text", "text": f"Sheet: {sheet_name}", "size": "sm", "color": "#555555"},
+                        {"type": "text", "text": invite_code, "size": "3xl", "weight": "bold", "color": "#1DB446", "align": "center"},
+                        {"type": "text", "text": "Share this code with your staff", "size": "xs", "color": "#888888", "align": "center"},
+                        {"type": "separator", "margin": "lg"},
+                        {"type": "text", "text": "Or share via LINE:", "size": "sm", "color": "#555555", "margin": "lg"},
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "uri",
+                                "label": "📤 Share Invite Link",
+                                "uri": f"https://line.me/R/msg/text/?Join%20my%20SlipSync%20sheet!%0A%0ACode:%20{invite_code}%0A%0AType%20/join%20{invite_code}%20in%20SlipSync%20bot"
+                            },
+                            "style": "primary",
+                            "color": "#00B900",
+                            "height": "sm"
+                        }
+                    ]
+                }
+            }
+            async with AsyncApiClient(configuration) as api_client:
+                line_bot_api = AsyncMessagingApi(api_client)
+                await line_bot_api.reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[FlexMessage(alt_text=f"Invite Code: {invite_code}", contents=FlexContainer.from_dict(invite_flex))]
+                ))
+            return
+        else:
+            reply = "❌ You don't have any sheets yet. Link a Google Sheet first, then you can invite staff!"
+    elif text.lower().startswith("/join"):
+        # Staff joining a sheet by invite code
+        parts = text.split()
+        if len(parts) < 2:
+            reply = "Usage: /join INVITE_CODE\n\nExample: /join ABC123"
+        else:
+            invite_code = parts[1].strip().upper()
+            sheet = await db.sheet.find_unique(where={'invite_code': invite_code})
+            if sheet:
+                # Check if already a member
+                existing = await db.sheetmembership.find_first(
+                    where={'subscription_id': sub.id, 'sheet_id': sheet.id}
+                )
+                if existing:
+                    reply = f"✅ You're already a member of this sheet!"
+                else:
+                    # Create membership as staff
+                    await db.sheetmembership.create(
+                        data={
+                            'subscription_id': sub.id,
+                            'sheet_id': sheet.id,
+                            'role': 'staff'
+                        }
+                    )
+                    # Set as active sheet
+                    await db.subscription.update(where={'id': sub.id}, data={'active_sheet_id': sheet.id})
+                    reply = f"✅ **Joined Sheet Successfully!**\n\nYou're now staff on this sheet. Your processed slips will be forwarded to the manager."
+            else:
+                reply = "❌ Invalid invite code. Please check with your manager for the correct code."
     else:
         # New user or unknown command -> send welcome Flex card
         flex_content = create_welcome_flex_message(lang)
@@ -807,6 +1093,32 @@ async def process_postback(user_id, data, reply_token):
             await line_bot_api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
                 messages=messages
+            ))
+    
+    elif data == 'onboard_manual':
+        # User chose "I Have a Sheet" - show manual setup steps
+        lang = await get_user_language(user_id)
+        flex_content = create_manual_onboard_flex_message(lang)
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[FlexMessage(alt_text="Manual Setup", contents=FlexContainer.from_dict(flex_content))]
+            ))
+    
+    elif data == 'onboard_auto':
+        # User chose "Create New" - LIFF not ready yet, show coming soon message
+        lang = await get_user_language(user_id)
+        coming_soon = {
+            "en": "✨ **Auto-Link Coming Soon!**\n\nThis feature will let you create and link a Sheet with one tap. For now, please use the manual option.\n\nWe're working hard on this! 🚀",
+            "th": "✨ **เชื่อมต่ออัตโนมัติ - เร็วๆ นี้!**\n\nฟีเจอร์นี้จะช่วยให้คุณสร้างและเชื่อมต่อ Sheet ได้ในแตะเดียว ตอนนี้กรุณาใช้ตัวเลือกแบบ Manual ก่อนนะคะ\n\nเรากำลังพัฒนาอยู่! 🚀",
+            "my": "✨ **Auto-Link မကြာမီလာမည်!**\n\nဤ feature ဖြင့် Sheet ကို တစ်ချက်နှိပ်ရုံဖြင့် ဖန်တီးပြီး ချိတ်ဆက်နိုင်မည်။ ယခုအချိန်တွင် manual option ကို အသုံးပြုပါ။\n\nကျွန်ုပ်တို့ ကြိုးစားနေပါသည်! 🚀"
+        }
+        async with AsyncApiClient(configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=coming_soon.get(lang, coming_soon["en"]))]
             ))
 
 async def process_image(user_id, msg_id, reply_token):
@@ -918,9 +1230,10 @@ async def process_image(user_id, msg_id, reply_token):
         }
     )
     daily_sum = sum(p.amount for p in payments)
+    slips_count = len(payments)
 
     # Prepare Flex Message
-    flex_content = create_payment_flex_message(data, daily_sum, sub.gsheet_id)
+    flex_content = create_payment_flex_message(data, daily_sum, slips_count, sub.gsheet_id)
     quick_reply = QuickReply(items=[
         QuickReplyItem(action=PostbackAction(label="Undo ↩️", data="undo_last", display_text="Undo Last Action"))
     ])
@@ -940,11 +1253,49 @@ async def process_image(user_id, msg_id, reply_token):
             messages=[flex_message]
         ))
         
+        # Get gsheet_id from active sheet
+        gsheet_id = None
+        if sub.active_sheet_id:
+            active_sheet = await db.sheet.find_unique(where={'id': sub.active_sheet_id})
+            if active_sheet:
+                gsheet_id = active_sheet.gsheet_id
+        
+        # Fallback to legacy gsheet_id if no active sheet
+        if not gsheet_id:
+            gsheet_id = sub.gsheet_id
+        
         # Then we push GSheet update notification if successful
-        success = update_gsheet(data, image_path, sub.gsheet_id)
-        if not success:
+        if gsheet_id:
+            success = update_gsheet(data, image_path, gsheet_id)
+            if not success:
+                error_card = create_error_flex_message(get_msg("link_instr", lang), lang)
+                await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[FlexMessage(alt_text="GSheet Error", contents=FlexContainer.from_dict(error_card))]))
+        else:
+            # No sheet linked, show error
             error_card = create_error_flex_message(get_msg("link_instr", lang), lang)
-            await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[FlexMessage(alt_text="GSheet Error", contents=FlexContainer.from_dict(error_card))]))
+            await line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[FlexMessage(alt_text="No Sheet Linked", contents=FlexContainer.from_dict(error_card))]))
+        
+        # Forward slip to sheet managers if user is staff
+        if sub.active_sheet_id:
+            try:
+                # Check if user is staff on this sheet
+                my_membership = await db.sheetmembership.find_first(
+                    where={'subscription_id': sub.id, 'sheet_id': sub.active_sheet_id}
+                )
+                if my_membership and my_membership.role == 'staff':
+                    # Find all managers of this sheet
+                    manager_memberships = await db.sheetmembership.find_many(
+                        where={'sheet_id': sub.active_sheet_id, 'role': 'manager'},
+                        include={'subscription': {'include': {'users': True}}}
+                    )
+                    for mm in manager_memberships:
+                        if mm.subscription and mm.subscription.users:
+                            for user in mm.subscription.users:
+                                if user.platform == 'line':
+                                    fwd_msg = f"📨 **New Slip from Staff**\n\n💰 {data.get('amount'):,.2f} {data.get('currency', 'THB')}\n📅 {data.get('date')} {data.get('time')}\n👤 Sender: {data.get('sender_name', '-')}"
+                                    await line_bot_api.push_message(PushMessageRequest(to=user.platform_id, messages=[TextMessage(text=fwd_msg)]))
+            except Exception as fwd_err:
+                logger.error(f"Failed to forward slip to manager: {fwd_err}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -40,14 +40,41 @@ model Subscription {
   is_paid          Boolean  @default(false)
   max_devices      Int      @default(3)
   rate_limit_daily Int      @default(10)
-  gsheet_id        String?  // The user's Google Sheet ID
+  active_sheet_id  String?  // Currently active sheet for this user
   created_at       DateTime @default(now())
   
   users            AuthorizedUser[]
   usage_logs       UsageLog[]
   payments         Payment[]
+  memberships      SheetMembership[]
 
   @@map("subscriptions")
+}
+
+model Sheet {
+  id          String   @id @default(uuid())
+  name        String?
+  gsheet_id   String
+  invite_code String   @unique
+  created_at  DateTime @default(now())
+  
+  memberships SheetMembership[]
+  payments    Payment[]
+
+  @@map("sheets")
+}
+
+model SheetMembership {
+  id              String       @id @default(uuid())
+  subscription_id String
+  subscription    Subscription @relation(fields: [subscription_id], references: [id])
+  sheet_id        String
+  sheet           Sheet        @relation(fields: [sheet_id], references: [id])
+  role            String       @default("manager")  // "manager" or "staff"
+  created_at      DateTime     @default(now())
+  
+  @@unique([subscription_id, sheet_id])
+  @@map("sheet_memberships")
 }
 
 model AuthorizedUser {
@@ -76,6 +103,8 @@ model Payment {
   id              Int          @id @default(autoincrement())
   subscription_id String
   subscription    Subscription @relation(fields: [subscription_id], references: [id])
+  sheet_id        String?
+  sheet           Sheet?       @relation(fields: [sheet_id], references: [id])
   amount          Float
   currency        String       @default("THB")
   sender_name     String?
